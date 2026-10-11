@@ -43,7 +43,14 @@ def run_command(command: List[str], *, timeout: int = 60) -> str:
     return completed.stdout
 
 
-def run_ollama(host: str, model: str, prompt: str, timeout: int) -> str:
+def run_ollama(
+    host: str,
+    model: str,
+    prompt: str,
+    timeout: int,
+    context_size: int,
+    max_tokens: int,
+) -> str:
     endpoint = host.rstrip("/") + "/api/generate"
     payload = json.dumps(
         {
@@ -52,7 +59,8 @@ def run_ollama(host: str, model: str, prompt: str, timeout: int) -> str:
             "stream": False,
             "options": {
                 "temperature": 0.1,
-                "num_ctx": 16384,
+                "num_ctx": context_size,
+                "num_predict": max_tokens,
             },
         }
     ).encode("utf-8")
@@ -109,14 +117,22 @@ def read_text(path: pathlib.Path, *, max_chars: int) -> str:
     return content[:max_chars] + "\n\n[Контекст обрезан harness]\n"
 
 
-def build_prompt(issue: Dict[str, object], source_paths: List[pathlib.Path]) -> str:
+def build_prompt(
+    issue: Dict[str, object],
+    source_paths: List[pathlib.Path],
+    include_project_files: bool,
+) -> str:
     contract = read_text(HARNESS_DIR / "agent-prompt.md", max_chars=12_000)
 
-    project_parts = []
-    for path in DEFAULT_CONTEXT_FILES:
-        if path.exists():
-            limit = 8_000 if path.name == "README.md" else 4_000
-            project_parts.append(f"## Файл {path.name}\n\n{read_text(path, max_chars=limit)}")
+    project_parts = [
+        "Основной язык проекта — русский. Фокус — подготовка backend-разработчиков "
+        "к System Design интервью. Координатор проверяет факты и принимает решения."
+    ]
+    if include_project_files:
+        for path in DEFAULT_CONTEXT_FILES:
+            if path.exists():
+                limit = 8_000 if path.name == "README.md" else 4_000
+                project_parts.append(f"## Файл {path.name}\n\n{read_text(path, max_chars=limit)}")
 
     source_parts = []
     for path in source_paths:
@@ -182,6 +198,32 @@ def save_result(issue: Dict[str, object], model: str, response: str) -> pathlib.
     return path
 
 
+def validate_single_table_row(response: str, required_columns: int) -> List[str]:
+    errors = []
+    rows = []
+    for line in response.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            continue
+        cells = [cell.strip() for cell in stripped[1:-1].split("|")]
+        if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+            continue
+        rows.append(cells)
+
+    data_rows = rows[1:] if rows else []
+    if len(data_rows) != 1:
+        errors.append(f"ожидалась одна строка данных, получено: {len(data_rows)}")
+        return errors
+
+    row = data_rows[0]
+    if len(row) != required_columns:
+        errors.append(f"ожидалось колонок: {required_columns}, получено: {len(row)}")
+    empty = [str(index + 1) for index, cell in enumerate(row) if not cell]
+    if empty:
+        errors.append("пустые колонки: " + ", ".join(empty))
+    return errors
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("issue", type=int, help="GitHub Issue number")
@@ -196,6 +238,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Print prompt and do not call Ollama")
     parser.add_argument("--timeout", type=int, default=900, help="Ollama timeout in seconds")
     parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama API base URL")
+    parser.add_argument("--context-size", type=int, default=8192, help="Ollama context window")
+    parser.add_argument("--max-tokens", type=int, default=1200, help="Maximum generated tokens")
+    parser.add_argument(
+        "--include-project-files",
+        action="store_true",
+        help="Include truncated README.md and AGENTS.md in addition to the short project brief",
+    )
+    parser.add_argument(
+        "--require-table-columns",
+        type=int,
+        help="Require exactly one non-empty Markdown table row with this many columns",
+    )
     return parser.parse_args()
 
 
@@ -210,13 +264,26 @@ def main() -> int:
         if not model:
             raise RuntimeError("Не указана модель и отсутствует label model:<name>")
 
-        prompt = build_prompt(issue, args.sources)
+        prompt = build_prompt(issue, args.sources, args.include_project_files)
         if args.dry_run:
             print(prompt)
             return 0
 
-        response = run_ollama(args.host, model, prompt, args.timeout)
+        response = run_ollama(
+            args.host,
+            model,
+            prompt,
+            args.timeout,
+            args.context_size,
+            args.max_tokens,
+        )
         result_path = save_result(issue, model, response)
+        if args.require_table_columns:
+            validation_errors = validate_single_table_row(response, args.require_table_columns)
+            if validation_errors:
+                print(result_path)
+                print("rejected: " + "; ".join(validation_errors), file=sys.stderr)
+                return 2
         print(result_path)
         return 0
     except (RuntimeError, json.JSONDecodeError) as error:

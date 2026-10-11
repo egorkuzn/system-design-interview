@@ -46,6 +46,25 @@ python3 harness/run.py 19 --model llama3
 python3 harness/run.py 25 --sources harness/source-packs/issue-25.md
 ```
 
+Полные `README.md` и `AGENTS.md` по умолчанию не передаются: для узких задач это лишний контекст. Если задача действительно зависит от них:
+
+```bash
+python3 harness/run.py 19 \
+  --sources harness/source-packs/issue-19.md \
+  --include-project-files
+```
+
+Для leaf-задачи, которая должна вернуть одну заполненную строку таблицы:
+
+```bash
+python3 harness/run.py 47 \
+  --model owl/t-lite:latest \
+  --sources harness/source-packs/issue-14-system-design-primer.md \
+  --require-table-columns 6
+```
+
+При нарушении контракта ответ сохраняется для диагностики, а runner завершается с кодом `2`.
+
 ## Ограничения
 
 - Модель не должна самостоятельно искать источники в интернете.
